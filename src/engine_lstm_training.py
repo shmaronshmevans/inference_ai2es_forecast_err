@@ -174,10 +174,21 @@ def main(
     """
     print("CUDA available?", torch.cuda.is_available())
     print("GPU count:", torch.cuda.device_count())
-    print("Device:", device)
-    device_id = 0
-    torch.cuda.set_device(device_id)
-    device = torch.device(f"cuda:{device_id}")
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    print("Requested device:", device)
+    # CPU-only PyTorch builds (common on macOS) cannot call CUDA APIs even when a
+    # cuda:* device was requested — fall back to CPU on any failure.
+    if device.type == "cuda" and torch.cuda.is_available():
+        try:
+            device_id = device.index if device.index is not None else 0
+            torch.cuda.set_device(device_id)
+            device = torch.device(f"cuda:{device_id}")
+        except (AttributeError, AssertionError, RuntimeError) as exc:
+            print(f"Warning: CUDA not usable ({exc!r}); using CPU.")
+            device = torch.device("cpu")
+    else:
+        device = torch.device("cpu")
     torch.manual_seed(101)
     print("::: LSTM Training :::")
 
@@ -309,7 +320,8 @@ def main(
 
             print("... completed ...")
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

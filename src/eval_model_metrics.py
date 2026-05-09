@@ -24,6 +24,8 @@ sys.path.append("..")
 
 from datetime import datetime
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -34,6 +36,7 @@ from model_data import (
     hrrr_data,
     nysm_data,
 )
+from model_data.skip_landtype_geo import LEGACY_LSTM_CLUSTERS_CSV, skip_landtype_geo
 
 
 # Output root used by `lstm_s2s_engine.py`.  Override via env var if
@@ -61,7 +64,8 @@ def columns_drop_hrrr(df):
             "longitude",
             "time",
             "orog",
-        ]
+        ],
+        errors="ignore",
     )
 
 
@@ -81,7 +85,8 @@ def columns_drop_nysm(df):
             "wdir_sonic",
             "snow_depth",
             "precip_total",
-        ]
+        ],
+        errors="ignore",
     )
 
 
@@ -135,16 +140,25 @@ def prepare_lstm_data(nysm_df, hrrr_df, station, metvar, fh=None, train=False):
     else:
         mytimes = hrrr_df["valid_time"].tolist()
 
-    geo_df = pd.read_csv("/home/aevans/nwp_bias/src/landtype/data/lstm_clusters.csv")
     stations = get_closest_nysm_stations.get_closest_stations_csv(station)
 
     hrrr_df1 = hrrr_df[hrrr_df["station"].isin(stations)].copy()
     nysm_df1 = nysm_df[nysm_df["station"].isin(stations)].copy()
 
-    # Map geo features by station name.
-    hrrr_df1 = create_geo_dict(geo_df, "lulc_cat", hrrr_df1)
-    hrrr_df1 = create_geo_dict(geo_df, "elev_cat", hrrr_df1)
-    hrrr_df1 = create_geo_dict(geo_df, "slope_cat", hrrr_df1)
+    geo_df = None
+    if not skip_landtype_geo():
+        try:
+            geo_df = pd.read_csv(LEGACY_LSTM_CLUSTERS_CSV)
+        except FileNotFoundError:
+            warnings.warn(
+                f"{LEGACY_LSTM_CLUSTERS_CSV} not found; continuing without geo columns.",
+                stacklevel=2,
+            )
+    if geo_df is not None:
+        # Map geo features by station name.
+        hrrr_df1 = create_geo_dict(geo_df, "lulc_cat", hrrr_df1)
+        hrrr_df1 = create_geo_dict(geo_df, "elev_cat", hrrr_df1)
+        hrrr_df1 = create_geo_dict(geo_df, "slope_cat", hrrr_df1)
 
     hrrr_df1 = columns_drop_hrrr(hrrr_df1)
 

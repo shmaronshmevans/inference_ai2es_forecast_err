@@ -20,6 +20,16 @@ Each parquet has the following columns (matching the schema produced by
     tp, mslma, orog, tcc, asnow, cape, dswrf, dlwrf, gh, lsm,
     lead time
 
+Herbie / what lands in ``hrrr_raw_dir``
+---------------------------------------
+This module calls ``Herbie.xarray(...)`` with per-variable search strings. That path
+downloads the **``.idx``** inventory first, then **HTTP byte-range** slices of the
+remote GRIB (often written as temporary ``subset_*`` files), not necessarily the full
+canonical ``hrrr.*.grib2`` filename. After cfgrib reads a subset, Herbie typically
+**removes** it again (``remove_grib=True``), so the folder often looks like “mostly
+``.idx``”. Full-archive downloads require ``Herbie.download()`` **without** subsetting
+and are much larger—only needed if you want intact GRIBs for other tools.
+
 Usage
 -----
 Run as a module from the ``app/`` directory::
@@ -38,7 +48,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 
@@ -69,6 +79,19 @@ _SEARCH_SPECS: list[dict] = [
     {"search": ":CAPE:surface", "var": "cape"},
     {"search": ":LAND:surface", "var": "lsm"},
 ]
+
+
+def _longitude_deg_to_180(lon: np.ndarray | pd.Series | float) -> np.ndarray:
+    """
+    Map longitude degrees to ``(-180, 180]``.
+
+    HRRR GRIB uses 0–360° east (e.g. ~281° for Pennsylvania) while mesonet
+    metadata uses negative west longitudes (e.g. −79°).  Without aligning
+    conventions, merges on ``(lat, lon)`` fail and BallTree nearest-neighbour
+    distances are meaningless.
+    """
+    lon = np.asarray(lon, dtype=float)
+    return ((lon + 180.0) % 360.0) - 180.0
 
 
 def _kelvin_to_celsius(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -104,6 +127,8 @@ def _extract_grib2(
     station_lookup: pd.DataFrame,
     init_time: datetime,
     fh: int,
+    *,
+    prefetch_full_grib: bool = False,
 ) -> pd.DataFrame | None:
     """
     Download one HRRR grib2 file and extract all required variables into a
@@ -134,10 +159,18 @@ def _extract_grib2(
 
     valid_time = init_time + timedelta(hours=fh)
 
+    # Optional: materialize full GRIB once per init/fxx. Herbie uses overwrite=false;
+    # skips network when the canonical file already exists under save_dir.
+    if prefetch_full_grib:
+        try:
+            herbie_obj.download(errors="warn")
+        except Exception as exc:
+            logger.debug("Herbie full GRIB prefetch skipped or failed: %s", exc)
+
     frames: list[pd.DataFrame] = []
     for spec in _SEARCH_SPECS:
         try:
-            ds = herbie_obj.xarray(spec["search"])
+            ds = herbie_obj.xarray(spec["search"], overwrite=False)
             if ds is None:
                 continue
             # herbie can return a Dataset or a DataArray depending on the field
@@ -167,6 +200,7 @@ def _extract_grib2(
             df_grid = df_grid[[lat_col, lon_col, data_col]].rename(
                 columns={data_col: spec["var"]}
             )
+            df_grid[lon_col] = _longitude_deg_to_180(df_grid[lon_col])
             frames.append(df_grid)
         except Exception as exc:
             logger.debug("Could not extract %s: %s", spec["var"], exc)
@@ -187,8 +221,9 @@ def _extract_grib2(
     # Nearest-neighbour assignment: find the closest grid point for each station
     tree_coords = np.deg2rad(merged[["lat", "lon"]].values)
     tree = BallTree(tree_coords, metric="haversine")
+    q_lon = _longitude_deg_to_180(station_lookup["lon"].values)
     query_coords = np.deg2rad(
-        station_lookup[["lat", "lon"]].values
+        np.column_stack([station_lookup["lat"].values, q_lon])
     )
     _, indices = tree.query(query_coords, k=1)
     indices = indices.flatten()
@@ -320,25 +355,49 @@ def fetch_and_stage(
             day_end = min(month_end, end_date)
 
             rows: list[pd.DataFrame] = []
+            first_failure: str | None = None
+            n_extract_empty = 0
+            n_ok = 0
             current_day = day_start
             while current_day <= day_end:
                 for init_hour in range(24):
+                    # UTC wall-clock instant for metadata / valid_time
                     init_dt = datetime(
-                        current_day.year, current_day.month, current_day.day, init_hour
+                        current_day.year,
+                        current_day.month,
+                        current_day.day,
+                        init_hour,
+                        tzinfo=timezone.utc,
                     )
+                    # Herbie's HRRR templates match archives using naive UTC clock times
+                    # (timezone-aware datetimes can prevent GRIB discovery on some setups).
+                    init_for_herbie = init_dt.replace(tzinfo=None)
                     try:
                         H = Herbie(
-                            init_dt,
+                            init_for_herbie,
                             model="hrrr",
                             product="sfc",
                             fxx=fh,
                             save_dir=str(cfg.data.hrrr_raw_dir),
                             verbose=False,
+                            overwrite=False,
+                            priority=["aws", "nomads", "google", "azure"],
                         )
-                        df_row = _extract_grib2(H, station_lookup, init_dt, fh)
+                        df_row = _extract_grib2(
+                            H,
+                            station_lookup,
+                            init_dt,
+                            fh,
+                            prefetch_full_grib=cfg.data.hrrr_prefetch_full_grib,
+                        )
                         if df_row is not None and len(df_row) > 0:
                             rows.append(df_row)
+                            n_ok += 1
+                        else:
+                            n_extract_empty += 1
                     except Exception as exc:
+                        if first_failure is None:
+                            first_failure = f"{type(exc).__name__}: {exc}"
                         logger.debug(
                             "Skipping HRRR init=%s fh=%s: %s", init_dt, fh, exc
                         )
@@ -354,7 +413,20 @@ def fetch_and_stage(
                     print(f" {len(month_df)} rows written.")
             else:
                 if show_progress:
-                    print(" no data found, skipping.")
+                    parts = [" no data found, skipping."]
+                    if first_failure:
+                        parts.append(f" Example failure: {first_failure[:200]}")
+                    elif n_extract_empty > 0 and n_ok == 0:
+                        parts.append(
+                            " Herbie ran without raising, but every hour returned no"
+                            " extracted rows — usually **eccodes** + **cfgrib** missing or"
+                            " GRIB variables not matched (see ``logging`` DEBUG on"
+                            " ``app.data.fetch_hrrr``)."
+                        )
+                    parts.append(
+                        " Init times are UTC; confirm network access to AWS/NOMADS archives."
+                    )
+                    print("".join(parts))
 
 
 if __name__ == "__main__":

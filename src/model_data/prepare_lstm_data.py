@@ -6,8 +6,9 @@ For a given station and target variable, this module:
    three closest neighbours via `get_closest_nysm_stations`).
 2. Pivots HRRR forecasts and NYSM observations from long to wide,
    producing one column set per neighbour.
-3. Merges HRRR + NYSM on `valid_time`, attaches geographic features
-   (`lulc_cat`, `elev_cat`, `slope_cat`), encodes `valid_time` with
+3. Merges HRRR + NYSM on `valid_time`, optionally attaches geographic features
+   (`lulc_cat`, `elev_cat`, `slope_cat`) from lstm_clusters.csv unless
+   :envvar:`FORECAST_APP_SKIP_GEO` is set, encodes `valid_time` with
    sin/cos features, and computes the target column `target_error =
    NWP - NYSM` (`get_error.nwp_error`).
 4. Returns a 5-tuple `(lstm_df, features, stations, target, valid_times)`
@@ -23,6 +24,8 @@ import sys
 
 sys.path.append("..")
 
+import warnings
+
 import pandas as pd
 
 from model_data import (
@@ -30,6 +33,7 @@ from model_data import (
     get_closest_nysm_stations,
     get_error,
 )
+from model_data.skip_landtype_geo import LEGACY_LSTM_CLUSTERS_CSV, skip_landtype_geo
 
 
 def create_geo_dict(geo_df, c, df1):
@@ -54,7 +58,8 @@ def columns_drop_hrrr(df):
             "longitude",
             "time",
             "orog",
-        ]
+        ],
+        errors="ignore",
     )
 
 
@@ -74,7 +79,8 @@ def columns_drop_nysm(df):
             "wdir_sonic",
             "snow_depth",
             "precip_total",
-        ]
+        ],
+        errors="ignore",
     )
 
 
@@ -152,18 +158,28 @@ def prepare_lstm_data(nysm_df, hrrr_df, station, metvar, fh, train=False):
     else:
         mytimes = hrrr_df["valid_time"].tolist()
 
-    geo_df = pd.read_csv("/home/aevans/nwp_bias/src/landtype/data/lstm_clusters.csv")
     stations = get_closest_nysm_stations.get_closest_stations_csv(station)
 
     hrrr_df1 = hrrr_df[hrrr_df["station"].isin(stations)].copy()
     nysm_df1 = nysm_df[nysm_df["station"].isin(stations)].copy()
 
-    # Map geo columns by station name (the previous code aligned a sliced
-    # geo_df1 by row position, which silently produced wrong rows whenever
-    # geo_df1 had a different length than hrrr_df1).
-    hrrr_df1 = create_geo_dict(geo_df, "lulc_cat", hrrr_df1)
-    hrrr_df1 = create_geo_dict(geo_df, "elev_cat", hrrr_df1)
-    hrrr_df1 = create_geo_dict(geo_df, "slope_cat", hrrr_df1)
+    geo_df = None
+    if not skip_landtype_geo():
+        try:
+            geo_df = pd.read_csv(LEGACY_LSTM_CLUSTERS_CSV)
+        except FileNotFoundError:
+            warnings.warn(
+                f"{LEGACY_LSTM_CLUSTERS_CSV} not found (FORECAST_APP_SKIP_GEO=0 or "
+                "use_geo_encoding); continuing without lulc_cat / elev_cat / slope_cat.",
+                stacklevel=2,
+            )
+    if geo_df is not None:
+        # Map geo columns by station name (the previous code aligned a sliced
+        # geo_df1 by row position, which silently produced wrong rows whenever
+        # geo_df1 had a different length than hrrr_df1).
+        hrrr_df1 = create_geo_dict(geo_df, "lulc_cat", hrrr_df1)
+        hrrr_df1 = create_geo_dict(geo_df, "elev_cat", hrrr_df1)
+        hrrr_df1 = create_geo_dict(geo_df, "slope_cat", hrrr_df1)
 
     hrrr_df1 = columns_drop_hrrr(hrrr_df1)
 

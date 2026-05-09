@@ -107,9 +107,9 @@ def make_station_csv(cfg, station_meta: Optional[pd.DataFrame] = None) -> Path:
 
 def prepare_env(cfg) -> dict[str, str]:
     """
-    Set all environment variables read by ``src/engine_*_training.py`` and
-    ``src/*_s2s_engine.py`` so they write/read to the app's output directories
-    rather than the hard-coded server paths.
+    Set all environment variables read by ``src/engine_*_training.py``,
+    ``src/*_s2s_engine.py``, and ``model_data.prepare_lstm_data`` so they use the
+    app's output directories and optional toggles (not hard-coded server paths).
 
     The env vars are set on ``os.environ`` immediately (no context manager).
     Re-run this function if you change ``cfg``.
@@ -127,6 +127,13 @@ def prepare_env(cfg) -> dict[str, str]:
 
     _set("LSTM_MODEL_DIR", str(cfg.output.models_dir))
     _set("LSTM_OUTPUT_DIR", str(cfg.output.results_dir))
+    # Geo categoricals from lstm_clusters.csv — off by default for the app (see config.yaml).
+    _set(
+        "FORECAST_APP_SKIP_GEO",
+        "0" if getattr(cfg.data, "use_geo_encoding", False) else "1",
+    )
+
+    patch_lookup_parquet(cfg)
 
     return env
 
@@ -135,12 +142,76 @@ def prepare_env(cfg) -> dict[str, str]:
 # Data-loader patching
 # ---------------------------------------------------------------------------
 
+def _valid_time_to_naive_utc(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip timezone from ``valid_time`` so it matches naive ``datetime`` bounds.
+
+    Parquets from ASOS/HRRR pipelines often store UTC-aware timestamps; the
+    training engines compare ``valid_time`` to naive ``datetime`` from the train
+    window, which raises ``TypeError`` if mixed.
+
+    Uses :meth:`~pandas.Series.dt.tz` (not ``is_datetime64tz_dtype`` alone) so
+    PyArrow-backed columns like ``timestamp[us, tz=UTC][pyarrow]`` are handled
+    after ``pd.to_datetime`` materializes them.
+    """
+    if df is None or "valid_time" not in df.columns:
+        return df
+    out = df.copy()
+    vt = pd.to_datetime(out["valid_time"])
+    try:
+        if hasattr(vt.dt, "tz") and vt.dt.tz is not None:
+            vt = vt.dt.tz_convert("UTC").dt.tz_localize(None)
+    except (TypeError, AttributeError):
+        pass
+    out["valid_time"] = vt
+    return out
+
+
+def _load_data_loader_modules():
+    """
+    Import observation / HRRR helper modules under every name the training
+    engines may use.
+
+    ``engine_*_training.py`` does ``from model_data import nysm_data`` (with
+    ``src/`` on ``sys.path``), while notebooks may use
+    ``import src.model_data.nysm_data``.  Those are **distinct** entries in
+    ``sys.modules``, so patches must be applied to both or loaders keep the
+    hard-coded server paths.
+    """
+    repo_root = str(Path(__file__).parent.parent.parent)
+    src_root = str(Path(repo_root) / "src")
+    for p in (repo_root, src_root):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+    nysm_modules = []
+    hrrr_modules = []
+    for name in ("src.model_data.nysm_data", "model_data.nysm_data"):
+        try:
+            nysm_modules.append(importlib.import_module(name))
+        except ImportError:
+            pass
+    for name in ("src.model_data.hrrr_data", "model_data.hrrr_data"):
+        try:
+            hrrr_modules.append(importlib.import_module(name))
+        except ImportError:
+            pass
+    if not nysm_modules:
+        raise ImportError("Could not import nysm_data (tried src.model_data and model_data).")
+    if not hrrr_modules:
+        raise ImportError("Could not import hrrr_data (tried src.model_data and model_data).")
+    return nysm_modules, hrrr_modules
+
+
 @contextmanager
 def patch_data_loaders(cfg):
     """
     Context manager that temporarily replaces the ``nysm_data.load_nysm_data``
-    and ``hrrr_data.read_hrrr_data`` functions in the ``src.model_data``
-    package with versions that read from the app's output directories.
+    and ``hrrr_data.read_hrrr_data`` functions with versions that read from
+    the app's output directories.
+
+    Patches **both** ``src.model_data.*`` and ``model_data.*`` module objects,
+    because the training engines import the latter when ``src/`` is on
+    ``sys.path``.
 
     The original functions are restored on exit, even on error.
 
@@ -149,23 +220,15 @@ def patch_data_loaders(cfg):
     >>> with patch_data_loaders(cfg):
     ...     train_main(...)
     """
-    # Ensure src/ is importable
-    repo_root = str(Path(__file__).parent.parent.parent)
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-
-    # Lazy-import so this module doesn't fail if src/ is not importable at
-    # module-load time (e.g. when running unit tests without src/ installed).
-    nysm_mod = importlib.import_module("src.model_data.nysm_data")
-    hrrr_mod = importlib.import_module("src.model_data.hrrr_data")
+    nysm_modules, hrrr_modules = _load_data_loader_modules()
 
     mesonet_dir = Path(cfg.data.parquets_dir) / "mesonet"
     hrrr_base_dir = Path(cfg.data.parquets_dir) / "hrrr_data"
 
     # ---- Build patched versions ----
 
-    original_nysm = nysm_mod.load_nysm_data
-    original_hrrr = hrrr_mod.read_hrrr_data
+    original_nysm = [(m, m.load_nysm_data) for m in nysm_modules]
+    original_hrrr = [(m, m.read_hrrr_data) for m in hrrr_modules]
 
     def patched_nysm(start_year):
         """Read app mesonet parquets instead of the hardcoded NYSM path."""
@@ -184,7 +247,7 @@ def patch_data_loaders(cfg):
         out = pd.concat(frames, ignore_index=True)
         out.fillna({"snow_depth": -999, "ta9m": -999}, inplace=True)
         out.dropna(inplace=True)
-        return out
+        return _valid_time_to_naive_utc(out)
 
     def patched_hrrr(fh, year):
         """Read app HRRR parquets instead of the hardcoded server path."""
@@ -201,18 +264,22 @@ def patch_data_loaders(cfg):
         df = pd.concat(frames, ignore_index=True).fillna(-999)
         if "new_tp" in df.columns:
             df = df.drop(columns=["new_tp"])
-        return df
+        return _valid_time_to_naive_utc(df)
 
     # ---- Apply patches ----
-    nysm_mod.load_nysm_data = patched_nysm
-    hrrr_mod.read_hrrr_data = patched_hrrr
+    for m in nysm_modules:
+        m.load_nysm_data = patched_nysm
+    for m in hrrr_modules:
+        m.read_hrrr_data = patched_hrrr
 
     try:
         yield
     finally:
         # ---- Restore originals ----
-        nysm_mod.load_nysm_data = original_nysm
-        hrrr_mod.read_hrrr_data = original_hrrr
+        for m, orig in original_nysm:
+            m.load_nysm_data = orig
+        for m, orig in original_hrrr:
+            m.read_hrrr_data = orig
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +433,7 @@ def patch_rapids_data_loaders(cfg):
         out = pd.concat(frames, ignore_index=True)
         out.fillna({"snow_depth": -999, "ta9m": -999}, inplace=True)
         out.dropna(inplace=True)
-        return out
+        return _valid_time_to_naive_utc(out)
 
     def patched_hrrr_rapids(fh, year):
         fh_str = str(fh).zfill(2)
@@ -382,7 +449,7 @@ def patch_rapids_data_loaders(cfg):
         df = pd.concat(frames, ignore_index=True).fillna(-999)
         if "new_tp" in df.columns:
             df = df.drop(columns=["new_tp"])
-        return df
+        return _valid_time_to_naive_utc(df)
 
     originals = {}
     for mod_name, attr, replacement in [
@@ -433,17 +500,31 @@ def patch_inference_pickle(cfg):
 
 def patch_lookup_parquet(cfg) -> None:
     """
-    Override ``LOOKUP_PARQUET`` in ``src.model_data.get_closest_nysm_stations``
-    to point to the app's triangulate_stations.parquet.
+    Override ``LOOKUP_PARQUET`` in ``get_closest_nysm_stations`` so reads use the
+    app's ``triangulate_stations.parquet``.
 
-    Call this once before any training or inference run.
+    Patches **both** ``src.model_data.get_closest_nysm_stations`` and
+    ``model_data.get_closest_nysm_stations`` (distinct ``sys.modules`` entries when
+    ``src/`` is on ``sys.path`` — same issue as :func:`patch_data_loaders`).
+
+    Call this once before any training or inference run (the ``02_train`` notebook
+    does this in Step 2).
     """
     repo_root = str(Path(__file__).parent.parent.parent)
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
+    src_root = str(Path(repo_root) / "src")
+    for p in (repo_root, src_root):
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
     lookup_path = str(
         Path(cfg.output.models_dir) / "lookups" / "triangulate_stations.parquet"
     )
-    gcn_mod = importlib.import_module("src.model_data.get_closest_nysm_stations")
-    gcn_mod.LOOKUP_PARQUET = lookup_path
+    for mod_name in (
+        "src.model_data.get_closest_nysm_stations",
+        "model_data.get_closest_nysm_stations",
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+            mod.LOOKUP_PARQUET = lookup_path
+        except ImportError:
+            pass

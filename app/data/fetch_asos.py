@@ -10,8 +10,9 @@ The output parquets are written to::
 
     {parquets_dir}/mesonet/mesonet_1H_obs_{YYYY}.parquet
 
-Each parquet has a multi-index ``(station, time_1H)`` and the following
-columns (matching the NYSM schema consumed by ``src/model_data/nysm_data.py``):
+Each parquet stores ``station`` and ``time_1H`` as columns (or a legacy
+multi-index on read) with the following data columns (matching the NYSM
+schema consumed by ``src/model_data/nysm_data.py``):
 
     lat, lon, elev, tair, ta9m, td, relh, srad, pres, mslp,
     wspd_sonic, wspd_sonic_mean, wmax_sonic, wdir_sonic,
@@ -411,6 +412,77 @@ def _build_station_df(
     return out[list(nysm_cols.keys())]
 
 
+def _flatten_mesonet_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
+    """Expand ``(station, time_1H)`` index to columns; normalize timestamps."""
+    out = df.reset_index() if isinstance(df.index, pd.MultiIndex) else df.copy()
+    if "time_1H" in out.columns:
+        out["time_1H"] = pd.to_datetime(out["time_1H"], utc=True)
+    return out
+
+
+def _mesonet_from_parquet(path: Path) -> pd.DataFrame:
+    """Load a mesonet parquet written by this module (flat or legacy MultiIndex)."""
+    df = pd.read_parquet(path)
+    if isinstance(df.index, pd.MultiIndex):
+        return df
+    if {"station", "time_1H"}.issubset(df.columns):
+        return df.set_index(["station", "time_1H"])
+    raise ValueError(
+        f"Unexpected mesonet parquet schema at {path}: "
+        "expected columns station and time_1H or a MultiIndex."
+    )
+
+
+def _dataframe_to_arrow_table(out: pd.DataFrame):
+    """
+    Build a PyArrow table without calling ``DataFrame.to_parquet`` or
+    ``pa.Table.from_pandas``, avoiding pandas extension-type registration
+    bugs (e.g. ``ArrowKeyError: pandas.period already defined`` in Jupyter).
+    """
+    import pyarrow as pa
+
+    arrays: list = []
+    names: list[str] = []
+    for col in out.columns:
+        s = out[col]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            s_dt = pd.to_datetime(s, utc=True)
+            naive = s_dt.dt.tz_convert("UTC").dt.tz_localize(None)
+            arrays.append(pa.array(naive.astype("datetime64[ns]")))
+        elif pd.api.types.is_bool_dtype(s):
+            arrays.append(pa.array(s.tolist(), type=pa.bool_()))
+        elif pd.api.types.is_integer_dtype(s) and not s.isna().any():
+            arrays.append(pa.array(s.astype("int64").to_numpy(), type=pa.int64()))
+        elif pd.api.types.is_numeric_dtype(s):
+            arrays.append(pa.array(s.astype("float64").to_numpy(), type=pa.float64()))
+        else:
+            arrays.append(
+                pa.array(
+                    [None if pd.isna(x) else str(x) for x in s.tolist()],
+                    type=pa.large_string(),
+                )
+            )
+        names.append(col)
+    return pa.Table.from_arrays(arrays, names=names)
+
+
+def _write_mesonet_parquet(df: pd.DataFrame, out_path: Path) -> None:
+    """
+    Write mesonet data to parquet.
+
+    Uses flat columns (no MultiIndex in the file) so downstream
+    ``reset_index()`` paths stay correct.  Writes via PyArrow built from
+    plain arrays — never ``DataFrame.to_parquet`` — so notebook kernels
+    do not hit pandas/pyarrow extension registration errors.
+    """
+    import pyarrow.parquet as pq
+
+    out = _flatten_mesonet_for_parquet(df)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    table = _dataframe_to_arrow_table(out)
+    pq.write_table(table, out_path)
+
+
 def fetch_asos_for_bbox(
     cfg,
     start_date: date,
@@ -525,13 +597,13 @@ def fetch_asos_for_bbox(
         new_df = pd.concat(frames)
         new_df = new_df[~new_df.index.duplicated(keep="last")]
         if out_path.exists():
-            existing = pd.read_parquet(out_path)
+            existing = _mesonet_from_parquet(out_path)
             combined = pd.concat([existing, new_df])
             combined = combined[~combined.index.duplicated(keep="last")]
             combined = combined.sort_index()
-            combined.to_parquet(out_path)
+            _write_mesonet_parquet(combined, out_path)
         else:
-            new_df.sort_index().to_parquet(out_path)
+            _write_mesonet_parquet(new_df.sort_index(), out_path)
         if show_progress:
             print(f"  Written: {out_path} ({len(new_df)} rows for {year})")
 

@@ -49,6 +49,12 @@ class DataConfig:
     metvars: List[str]
     mesonet_local_dir: Optional[Path] = None
     station_meta_csv: Optional[Path] = None
+    # When True, call Herbie.download() once per init/fxx before extracting variables.
+    # Together with overwrite=False (always), existing files in hrrr_raw_dir are reused.
+    hrrr_prefetch_full_grib: bool = False
+    # Landcover / elevation / slope categoricals from lstm_clusters.csv (legacy NY path).
+    # Keep false for this repo unless you provide that CSV on disk.
+    use_geo_encoding: bool = False
 
     def __post_init__(self) -> None:
         valid_sources = {"asos", "local"}
@@ -225,6 +231,8 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         metvars=[str(v) for v in d.get("metvars", ["t2m"])],
         mesonet_local_dir=_path(d.get("mesonet_local_dir")),
         station_meta_csv=_path(d.get("station_meta_csv")),
+        hrrr_prefetch_full_grib=bool(d.get("hrrr_prefetch_full_grib", False)),
+        use_geo_encoding=bool(d.get("use_geo_encoding", False)),
     )
 
     t = raw["training"]

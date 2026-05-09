@@ -14,6 +14,8 @@ import sys
 
 sys.path.append("..")
 
+import warnings
+
 import cudf
 import pandas as pd
 
@@ -22,6 +24,7 @@ from model_data import (
     get_closest_nysm_stations,
     get_error,
 )
+from model_data.skip_landtype_geo import LEGACY_LSTM_CLUSTERS_CSV, skip_landtype_geo
 
 
 def add_suffix(df, station):
@@ -133,22 +136,41 @@ def prepare_lstm_data(nysm_df, hrrr_df, station, metvar, fh,
             & (nysm_df["valid_time"] <= now_ts)
         ]
 
-    geo_df = cudf.read_csv("/home/aevans/nwp_bias/src/landtype/data/lstm_clusters.csv")
     stations = get_closest_nysm_stations.get_closest_stations_csv(station)
     hrrr_df1 = hrrr_df[hrrr_df["station"].isin(stations)]
     nysm_df1 = nysm_df[nysm_df["station"].isin(stations)]
 
-    # Map geo features by station name (round-trip via pandas to avoid the
-    # positional-indexing bug the previous version had).
-    geo_df_pd = geo_df.to_pandas()
-    hrrr_df1_pd = hrrr_df1.to_pandas()
-    for col in ["lulc_cat", "elev_cat", "slope_cat"]:
-        hrrr_df1_pd = _map_geo_column(geo_df_pd, hrrr_df1_pd, col)
-    hrrr_df1 = cudf.from_pandas(hrrr_df1_pd)
+    geo_df_pd = None
+    if not skip_landtype_geo():
+        try:
+            geo_df = cudf.read_csv(LEGACY_LSTM_CLUSTERS_CSV)
+            geo_df_pd = geo_df.to_pandas()
+        except FileNotFoundError:
+            warnings.warn(
+                f"{LEGACY_LSTM_CLUSTERS_CSV} not found; continuing without "
+                "lulc_cat / elev_cat / slope_cat.",
+                stacklevel=2,
+            )
+    if geo_df_pd is not None:
+        # Map geo features by station name (round-trip via pandas to avoid the
+        # positional-indexing bug the previous version had).
+        hrrr_df1_pd = hrrr_df1.to_pandas()
+        for col in ["lulc_cat", "elev_cat", "slope_cat"]:
+            hrrr_df1_pd = _map_geo_column(geo_df_pd, hrrr_df1_pd, col)
+        hrrr_df1 = cudf.from_pandas(hrrr_df1_pd)
 
-    hrrr_df1 = hrrr_df1.drop(
-        columns=["index", "lead time", "lsm", "latitude", "longitude", "time", "orog"]
-    )
+    _hrrr_drop = [
+        "index",
+        "lead time",
+        "lsm",
+        "latitude",
+        "longitude",
+        "time",
+        "orog",
+    ]
+    _present = [c for c in _hrrr_drop if c in hrrr_df1.columns]
+    if _present:
+        hrrr_df1 = hrrr_df1.drop(columns=_present)
 
     master_df = dataframe_wrapper(stations, hrrr_df1)
     master_df2 = dataframe_wrapper(stations, nysm_df1)

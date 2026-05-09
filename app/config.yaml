@@ -14,44 +14,61 @@
 # ---------------------------------------------------------------------------
 bbox:
   lat_min: 40.0
-  lat_max: 43.5
+  lat_max: 41.5
   lon_min: -80.0
-  lon_max: -71.5
+  lon_max: -78.5
 
 # ---------------------------------------------------------------------------
 # Data sources
 # ---------------------------------------------------------------------------
 data:
-  # Directory where raw HRRR grib2 files will be downloaded (or already live).
+  # Herbie download/cache directory for raw HRRR grib2 (not cleaned parquets).
   hrrr_raw_dir: ./output/hrrr_raw
+
+  # If true, fetch one full SFC GRIB per model init/fxx before extracting fields.
+  # Herbie always uses overwrite=false: existing canonical GRIBs under hrrr_raw_dir
+  # are not re-downloaded. Leave false to rely on smaller subset pulls only (more
+  # remote traffic). Set true for a reusable on-disk archive.
+  hrrr_prefetch_full_grib: false
 
   # Root directory for all cleaned parquet files produced during setup.
   parquets_dir: ./output/parquets
 
   # Observation network to use.
-  #   "asos"  — download ASOS hourly obs from the IEM REST API
-  #   "local" — read pre-existing parquets from `mesonet_local_dir`
+  #   "asos"  — download ASOS hourly obs from the IEM REST API (default)
+  #   "local" — always use pre-existing parquets from `mesonet_local_dir` only
+  # If `mesonet_source` is "asos" but `mesonet_local_dir` points to a directory
+  # that already contains `mesonet_1H_obs_*.parquet` (e.g. a mounted drive), the
+  # setup notebook uses that data and does **not** re-download ASOS.
   mesonet_source: asos
 
-  # Path to a directory containing pre-cleaned 1H mesonet parquets.
-  # Only required when mesonet_source == "local".
+  # Pre-cleaned 1H mesonet parquets (optional when using IEM download).
+  # Required when mesonet_source == "local".
+  # When set and those parquet files exist, they are staged into `parquets_dir/mesonet`
+  # and ASOS download is skipped even if mesonet_source == "asos".
   # Expected filename pattern: mesonet_1H_obs_{YYYY}.parquet
   # Required columns: station, valid_time, tair, wspd_sonic_mean,
   #                   precip_total, lat, lon, elev
   mesonet_local_dir: null
 
-  # Path to a CSV with station metadata.
-  # Required columns: station, lat, lon
-  # When mesonet_source == "asos" this is generated automatically during
-  # data setup and this field can be left as null.
+  # Optional CSV with station metadata (station, lat, lon [, elev]).
+  # When using local/mounted mesonet without this file, station metadata is
+  # inferred from the first mesonet parquet.
+  # When mesonet_source == "asos" and data is downloaded from IEM, this is
+  # generated automatically during setup unless you override it here.
   station_meta_csv: null
 
   # HRRR forecast hours to download and model.  1–18 are supported.
-  forecast_hours: [1, 3, 6, 12, 18]
+  forecast_hours: [1]
 
   # Target meteorological variables.
   # Supported: t2m (2 m temperature), u_total (wind speed), tp (precipitation)
   metvars: [t2m, u_total, tp]
+
+  # Geographic categoricals (lulc_cat, elev_cat, slope_cat) from lstm_clusters.csv.
+  # The legacy training code expects that file under a fixed server path; leave false
+  # unless you have placed lstm_clusters.csv there and want those features.
+  use_geo_encoding: false
 
 # ---------------------------------------------------------------------------
 # Model family
@@ -67,8 +84,8 @@ model: lstm
 # ---------------------------------------------------------------------------
 training:
   # Date range covering ALL available data (train + val + test together).
-  start_date: "2023-01-01"
-  end_date:   "2024-12-31"
+  start_date: "2026-01-01"
+  end_date:   "2026-01-03"
 
   # Chronological split fractions — must sum to 1.0.
   # The date range is divided in order: train → val → test.
