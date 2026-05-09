@@ -59,7 +59,7 @@ data:
   station_meta_csv: null
 
   # HRRR forecast hours to download and model.  1–18 are supported.
-  forecast_hours: [1]
+  forecast_hours: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18]
 
   # Target meteorological variables.
   # Supported: t2m (2 m temperature), u_total (wind speed), tp (precipitation)
